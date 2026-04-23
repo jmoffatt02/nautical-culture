@@ -1,0 +1,1044 @@
+import { useState, useEffect, useMemo, useRef } from 'react'
+
+// ---------- storage helpers ----------
+const STORAGE_KEY = 'pokemon-matches'
+
+async function loadMatches() {
+  try {
+    const result = await window.storage.get(STORAGE_KEY)
+    if (!result) return []
+    return JSON.parse(result.value)
+  } catch (e) {
+    return []
+  }
+}
+
+async function saveMatches(matches) {
+  try {
+    await window.storage.set(STORAGE_KEY, JSON.stringify(matches))
+  } catch (e) {
+    console.error('save failed', e)
+  }
+}
+
+// ---------- utils ----------
+const uid = () => Math.random().toString(36).slice(2, 11)
+
+const normalize = (s) => s.trim().toLowerCase()
+
+const parseImportText = (text) => {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+  const matches = []
+  const today = new Date().toISOString()
+
+  for (const line of lines) {
+    // split on comma OR tab
+    const parts = line.split(/[,\t]/).map(p => p.trim()).filter(Boolean)
+    if (parts.length < 2) continue
+
+    const opponent = parts[0]
+
+    // detect format: "name, W" or "name, L" or "name, W/L/W/L"
+    if (parts.length === 2) {
+      const r = parts[1].toUpperCase()
+      // could be a single result or a string like "WLLWW"
+      if (r === 'W' || r === 'WIN' || r === '1') {
+        matches.push({ id: uid(), opponent, result: 'W', date: today })
+      } else if (r === 'L' || r === 'LOSS' || r === 'LOSE' || r === '0') {
+        matches.push({ id: uid(), opponent, result: 'L', date: today })
+      } else if (/^[WL]+$/i.test(r)) {
+        // string like "WWLW" - one match per char
+        for (const ch of r) {
+          matches.push({ id: uid(), opponent, result: ch.toUpperCase(), date: today })
+        }
+      }
+    } else if (parts.length >= 3) {
+      // "name, wins, losses" aggregate format
+      const wins = parseInt(parts[1], 10)
+      const losses = parseInt(parts[2], 10)
+      if (!isNaN(wins) && !isNaN(losses)) {
+        for (let i = 0; i < wins; i++) {
+          matches.push({ id: uid(), opponent, result: 'W', date: today })
+        }
+        for (let i = 0; i < losses; i++) {
+          matches.push({ id: uid(), opponent, result: 'L', date: today })
+        }
+      }
+    }
+  }
+  return matches
+}
+
+const exportToCsv = (matches) => {
+  const header = 'opponent,result,date\n'
+  const rows = matches.map(m => `${m.opponent},${m.result},${m.date}`).join('\n')
+  return header + rows
+}
+
+// ---------- main ----------
+export default function PokemonTracker() {
+  const [matches, setMatches] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [opponent, setOpponent] = useState('')
+  const [showImport, setShowImport] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [importPreview, setImportPreview] = useState(null)
+  const [sortBy, setSortBy] = useState('played')
+  const [filterText, setFilterText] = useState('')
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [flashId, setFlashId] = useState(null)
+  const inputRef = useRef(null)
+
+  // load on mount
+  useEffect(() => {
+    loadMatches().then(m => {
+      setMatches(m)
+      setLoading(false)
+    })
+  }, [])
+
+  // persist whenever matches change (after initial load)
+  useEffect(() => {
+    if (!loading) saveMatches(matches)
+  }, [matches, loading])
+
+  // ---------- derived stats ----------
+  const stats = useMemo(() => {
+    const total = matches.length
+    const wins = matches.filter(m => m.result === 'W').length
+    const losses = total - wins
+    const winRate = total > 0 ? (wins / total) * 100 : 0
+
+    // per-opponent aggregation (case-insensitive)
+    const byOpponent = {}
+    for (const m of matches) {
+      const key = normalize(m.opponent)
+      if (!byOpponent[key]) {
+        byOpponent[key] = { name: m.opponent, wins: 0, losses: 0, played: 0 }
+      }
+      byOpponent[key].played++
+      if (m.result === 'W') byOpponent[key].wins++
+      else byOpponent[key].losses++
+    }
+    const opponents = Object.values(byOpponent).map(o => ({
+      ...o,
+      winRate: o.played > 0 ? (o.wins / o.played) * 100 : 0
+    }))
+
+    // current streak (from most recent match backward)
+    const sortedByDate = [...matches].sort((a, b) => new Date(b.date) - new Date(a.date))
+    let streak = 0
+    let streakType = null
+    for (const m of sortedByDate) {
+      if (streakType === null) {
+        streakType = m.result
+        streak = 1
+      } else if (m.result === streakType) {
+        streak++
+      } else {
+        break
+      }
+    }
+
+    return { total, wins, losses, winRate, opponents, streak, streakType }
+  }, [matches])
+
+  const sortedOpponents = useMemo(() => {
+    const filtered = stats.opponents.filter(o =>
+      o.name.toLowerCase().includes(filterText.toLowerCase())
+    )
+    const sorted = [...filtered]
+    sorted.sort((a, b) => {
+      if (sortBy === 'name') return a.name.localeCompare(b.name)
+      if (sortBy === 'winrate') return b.winRate - a.winRate
+      if (sortBy === 'wins') return b.wins - a.wins
+      if (sortBy === 'losses') return b.losses - a.losses
+      return b.played - a.played // default: played
+    })
+    return sorted
+  }, [stats.opponents, sortBy, filterText])
+
+  const recentMatches = useMemo(() => {
+    return [...matches]
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, 12)
+  }, [matches])
+
+  // existing opponent names for autocomplete
+  const knownOpponents = useMemo(() => {
+    return [...new Set(matches.map(m => m.opponent))]
+      .sort((a, b) => {
+        const aCount = matches.filter(m => normalize(m.opponent) === normalize(a)).length
+        const bCount = matches.filter(m => normalize(m.opponent) === normalize(b)).length
+        return bCount - aCount
+      })
+  }, [matches])
+
+  // ---------- handlers ----------
+  const addMatch = (result) => {
+    const name = opponent.trim()
+    if (!name) {
+      inputRef.current?.focus()
+      return
+    }
+    // use canonical casing if opponent already exists
+    const existing = matches.find(m => normalize(m.opponent) === normalize(name))
+    const canonicalName = existing ? existing.opponent : name
+
+    const newMatch = {
+      id: uid(),
+      opponent: canonicalName,
+      result,
+      date: new Date().toISOString()
+    }
+    setMatches(prev => [...prev, newMatch])
+    setOpponent('')
+    setFlashId(newMatch.id)
+    setTimeout(() => setFlashId(null), 800)
+    inputRef.current?.focus()
+  }
+
+  const deleteMatch = (id) => {
+    setMatches(prev => prev.filter(m => m.id !== id))
+  }
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter') {
+      // shift+enter = loss, plain enter = win
+      addMatch(e.shiftKey ? 'L' : 'W')
+    }
+  }
+
+  const previewImport = () => {
+    const parsed = parseImportText(importText)
+    setImportPreview(parsed)
+  }
+
+  const commitImport = () => {
+    if (!importPreview) return
+    setMatches(prev => [...prev, ...importPreview])
+    setImportText('')
+    setImportPreview(null)
+    setShowImport(false)
+  }
+
+  const downloadCsv = () => {
+    const csv = exportToCsv(matches)
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `pokemon-matches-${new Date().toISOString().slice(0,10)}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const clearAll = () => {
+    setMatches([])
+    setConfirmClear(false)
+  }
+
+  // ---------- render ----------
+  if (loading) {
+    return (
+      <div style={{
+        minHeight: '100vh',
+        background: '#0a0a0f',
+        color: '#71717a',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: 'JetBrains Mono, monospace'
+      }}>
+        loading matches...
+      </div>
+    )
+  }
+
+  return (
+    <div className="tracker-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600;800&family=Manrope:wght@400;500;700&display=swap');
+
+        .tracker-root {
+          --bg: #0a0a0f;
+          --surface: #13131c;
+          --surface-hover: #1a1a25;
+          --border: #26262f;
+          --border-strong: #3a3a48;
+          --text: #f4f4f5;
+          --text-muted: #71717a;
+          --text-dim: #52525b;
+          --win: #34d399;
+          --win-glow: rgba(52, 211, 153, 0.15);
+          --loss: #f87171;
+          --loss-glow: rgba(248, 113, 113, 0.15);
+          --accent: #fbbf24;
+
+          min-height: 100vh;
+          background: var(--bg);
+          background-image:
+            radial-gradient(circle at 20% 0%, rgba(251, 191, 36, 0.04) 0%, transparent 50%),
+            radial-gradient(circle at 80% 100%, rgba(52, 211, 153, 0.03) 0%, transparent 50%);
+          color: var(--text);
+          font-family: 'Manrope', sans-serif;
+          padding: 2.5rem 1.5rem 4rem;
+        }
+
+        .container {
+          max-width: 1100px;
+          margin: 0 auto;
+        }
+
+        /* HEADER */
+        .header {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-end;
+          margin-bottom: 2.5rem;
+          padding-bottom: 1.5rem;
+          border-bottom: 1px solid var(--border);
+          flex-wrap: wrap;
+          gap: 1rem;
+        }
+        .title-block h1 {
+          font-family: 'Bricolage Grotesque', sans-serif;
+          font-weight: 800;
+          font-size: clamp(1.8rem, 4vw, 2.8rem);
+          letter-spacing: -0.03em;
+          line-height: 1;
+          margin: 0;
+        }
+        .title-block .subtitle {
+          color: var(--text-dim);
+          font-size: 0.85rem;
+          margin-top: 0.4rem;
+          font-family: 'JetBrains Mono', monospace;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+        }
+        .accent-bar {
+          display: inline-block;
+          width: 0.8rem;
+          height: 0.8rem;
+          background: var(--accent);
+          margin-right: 0.6rem;
+          vertical-align: middle;
+          transform: rotate(45deg);
+        }
+        .record-pill {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 1.1rem;
+          font-weight: 600;
+          padding: 0.6rem 1rem;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+        }
+        .record-pill .w { color: var(--win); }
+        .record-pill .l { color: var(--loss); }
+        .record-pill .sep { color: var(--text-dim); }
+
+        /* QUICK ADD */
+        .quick-add {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          padding: 1.5rem;
+          margin-bottom: 2rem;
+          position: relative;
+        }
+        .quick-add::before {
+          content: '';
+          position: absolute;
+          top: 0; left: 0;
+          width: 3px;
+          height: 100%;
+          background: var(--accent);
+        }
+        .quick-add-label {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.7rem;
+          text-transform: uppercase;
+          letter-spacing: 0.15em;
+          color: var(--text-dim);
+          margin-bottom: 0.8rem;
+        }
+        .input-row {
+          display: flex;
+          gap: 0.6rem;
+          flex-wrap: wrap;
+        }
+        .opponent-input {
+          flex: 1;
+          min-width: 200px;
+          background: var(--bg);
+          border: 1px solid var(--border-strong);
+          color: var(--text);
+          padding: 0.85rem 1rem;
+          font-size: 1rem;
+          font-family: 'Manrope', sans-serif;
+          outline: none;
+          transition: border-color 0.15s;
+        }
+        .opponent-input:focus {
+          border-color: var(--accent);
+        }
+        .opponent-input::placeholder {
+          color: var(--text-dim);
+        }
+        .result-btn {
+          padding: 0.85rem 1.5rem;
+          border: 1px solid;
+          background: transparent;
+          font-family: 'JetBrains Mono', monospace;
+          font-weight: 700;
+          font-size: 1rem;
+          cursor: pointer;
+          letter-spacing: 0.05em;
+          transition: all 0.15s;
+        }
+        .result-btn.win {
+          border-color: var(--win);
+          color: var(--win);
+        }
+        .result-btn.win:hover {
+          background: var(--win-glow);
+        }
+        .result-btn.loss {
+          border-color: var(--loss);
+          color: var(--loss);
+        }
+        .result-btn.loss:hover {
+          background: var(--loss-glow);
+        }
+        .keyboard-hint {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.7rem;
+          color: var(--text-dim);
+          margin-top: 0.7rem;
+        }
+        .keyboard-hint kbd {
+          background: var(--bg);
+          border: 1px solid var(--border-strong);
+          padding: 0.1rem 0.4rem;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.7rem;
+          color: var(--text);
+        }
+        .quick-chips {
+          display: flex;
+          gap: 0.4rem;
+          flex-wrap: wrap;
+          margin-top: 0.8rem;
+        }
+        .chip {
+          background: var(--bg);
+          border: 1px solid var(--border-strong);
+          color: var(--text-muted);
+          padding: 0.3rem 0.7rem;
+          font-size: 0.8rem;
+          font-family: 'Manrope', sans-serif;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+        .chip:hover {
+          border-color: var(--accent);
+          color: var(--text);
+        }
+
+        /* STATS GRID */
+        .stats-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 0.8rem;
+          margin-bottom: 2rem;
+        }
+        .stat-card {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          padding: 1.2rem 1.4rem;
+        }
+        .stat-label {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.7rem;
+          text-transform: uppercase;
+          letter-spacing: 0.15em;
+          color: var(--text-dim);
+          margin-bottom: 0.6rem;
+        }
+        .stat-value {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 2rem;
+          font-weight: 800;
+          line-height: 1;
+          letter-spacing: -0.02em;
+        }
+        .stat-value.win { color: var(--win); }
+        .stat-value.loss { color: var(--loss); }
+        .stat-value.accent { color: var(--accent); }
+        .stat-meta {
+          color: var(--text-dim);
+          font-size: 0.75rem;
+          margin-top: 0.4rem;
+          font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* SECTION HEADER */
+        .section {
+          margin-bottom: 2rem;
+        }
+        .section-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 1rem;
+          flex-wrap: wrap;
+          gap: 0.6rem;
+        }
+        .section-title {
+          font-family: 'Bricolage Grotesque', sans-serif;
+          font-size: 1.3rem;
+          font-weight: 600;
+          letter-spacing: -0.01em;
+          margin: 0;
+        }
+
+        /* OPPONENT TABLE */
+        .opp-controls {
+          display: flex;
+          gap: 0.5rem;
+          align-items: center;
+          flex-wrap: wrap;
+        }
+        .filter-input {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          color: var(--text);
+          padding: 0.45rem 0.8rem;
+          font-size: 0.85rem;
+          font-family: 'Manrope', sans-serif;
+          outline: none;
+          width: 180px;
+        }
+        .filter-input:focus { border-color: var(--accent); }
+        .sort-select {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          color: var(--text);
+          padding: 0.45rem 0.8rem;
+          font-size: 0.85rem;
+          font-family: 'JetBrains Mono', monospace;
+          outline: none;
+          cursor: pointer;
+        }
+        .opp-table {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .opp-table th {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.7rem;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          color: var(--text-dim);
+          text-align: left;
+          padding: 0.9rem 1rem;
+          font-weight: 500;
+          border-bottom: 1px solid var(--border);
+        }
+        .opp-table th.num, .opp-table td.num {
+          text-align: right;
+        }
+        .opp-table tr {
+          transition: background 0.1s;
+        }
+        .opp-table tbody tr:hover {
+          background: var(--surface-hover);
+        }
+        .opp-table td {
+          padding: 0.85rem 1rem;
+          border-bottom: 1px solid var(--border);
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.9rem;
+        }
+        .opp-table tbody tr:last-child td {
+          border-bottom: none;
+        }
+        .opp-name {
+          font-family: 'Manrope', sans-serif !important;
+          font-weight: 500;
+          font-size: 0.95rem !important;
+        }
+        .winrate-cell {
+          display: flex;
+          align-items: center;
+          gap: 0.7rem;
+          justify-content: flex-end;
+        }
+        .winrate-bar {
+          width: 60px;
+          height: 4px;
+          background: var(--border);
+          position: relative;
+          overflow: hidden;
+        }
+        .winrate-fill {
+          position: absolute;
+          left: 0; top: 0;
+          height: 100%;
+          background: var(--win);
+          transition: width 0.3s;
+        }
+        .winrate-text {
+          min-width: 48px;
+          text-align: right;
+        }
+        .wr-good { color: var(--win); }
+        .wr-bad { color: var(--loss); }
+        .wr-mid { color: var(--text-muted); }
+        .empty-state {
+          text-align: center;
+          padding: 3rem 1rem;
+          color: var(--text-dim);
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.85rem;
+        }
+
+        /* RECENT MATCHES */
+        .recent-list {
+          display: flex;
+          flex-direction: column;
+          gap: 0.4rem;
+        }
+        .recent-item {
+          display: flex;
+          align-items: center;
+          gap: 1rem;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          padding: 0.7rem 1rem;
+          font-family: 'Manrope', sans-serif;
+          transition: all 0.2s;
+        }
+        .recent-item.flash {
+          background: var(--win-glow);
+          border-color: var(--win);
+        }
+        .recent-item.flash.l {
+          background: var(--loss-glow);
+          border-color: var(--loss);
+        }
+        .result-tag {
+          font-family: 'JetBrains Mono', monospace;
+          font-weight: 800;
+          font-size: 0.85rem;
+          width: 24px;
+          height: 24px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+        .result-tag.W {
+          background: var(--win);
+          color: var(--bg);
+        }
+        .result-tag.L {
+          background: var(--loss);
+          color: var(--bg);
+        }
+        .recent-name {
+          flex: 1;
+          font-weight: 500;
+          font-size: 0.95rem;
+        }
+        .recent-date {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.75rem;
+          color: var(--text-dim);
+        }
+        .delete-btn {
+          background: transparent;
+          border: none;
+          color: var(--text-dim);
+          cursor: pointer;
+          padding: 0.3rem 0.5rem;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.85rem;
+          opacity: 0;
+          transition: opacity 0.15s, color 0.15s;
+        }
+        .recent-item:hover .delete-btn {
+          opacity: 1;
+        }
+        .delete-btn:hover {
+          color: var(--loss);
+        }
+
+        /* IMPORT / TOOLS */
+        .tools-bar {
+          display: flex;
+          gap: 0.5rem;
+          flex-wrap: wrap;
+          margin-top: 2rem;
+          padding-top: 2rem;
+          border-top: 1px solid var(--border);
+        }
+        .tool-btn {
+          background: transparent;
+          border: 1px solid var(--border-strong);
+          color: var(--text-muted);
+          padding: 0.6rem 1rem;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.8rem;
+          cursor: pointer;
+          letter-spacing: 0.05em;
+          transition: all 0.15s;
+        }
+        .tool-btn:hover {
+          border-color: var(--accent);
+          color: var(--text);
+        }
+        .tool-btn.danger:hover {
+          border-color: var(--loss);
+          color: var(--loss);
+        }
+        .import-panel {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          padding: 1.5rem;
+          margin-top: 1rem;
+        }
+        .import-panel h3 {
+          font-family: 'Bricolage Grotesque', sans-serif;
+          margin: 0 0 0.5rem;
+          font-size: 1.1rem;
+        }
+        .import-panel p {
+          color: var(--text-muted);
+          font-size: 0.85rem;
+          margin: 0 0 1rem;
+          line-height: 1.5;
+        }
+        .import-panel code {
+          background: var(--bg);
+          padding: 0.1rem 0.4rem;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.8rem;
+          color: var(--accent);
+        }
+        .import-textarea {
+          width: 100%;
+          background: var(--bg);
+          border: 1px solid var(--border-strong);
+          color: var(--text);
+          padding: 0.8rem;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.85rem;
+          min-height: 150px;
+          outline: none;
+          resize: vertical;
+          box-sizing: border-box;
+        }
+        .import-textarea:focus {
+          border-color: var(--accent);
+        }
+        .import-actions {
+          display: flex;
+          gap: 0.5rem;
+          margin-top: 0.8rem;
+          align-items: center;
+          flex-wrap: wrap;
+        }
+        .import-preview-info {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 0.8rem;
+          color: var(--win);
+        }
+      `}</style>
+
+      <div className="container">
+
+        {/* HEADER */}
+        <div className="header">
+          <div className="title-block">
+            <h1><span className="accent-bar"></span>matchup tracker</h1>
+            <div className="subtitle">pokemon · win/loss log</div>
+          </div>
+          {stats.total > 0 && (
+            <div className="record-pill">
+              <span className="w">{stats.wins}W</span>
+              <span className="sep">/</span>
+              <span className="l">{stats.losses}L</span>
+            </div>
+          )}
+        </div>
+
+        {/* QUICK ADD */}
+        <div className="quick-add">
+          <div className="quick-add-label">// log a match</div>
+          <div className="input-row">
+            <input
+              ref={inputRef}
+              className="opponent-input"
+              placeholder="opponent pokemon..."
+              value={opponent}
+              onChange={(e) => setOpponent(e.target.value)}
+              onKeyDown={handleKey}
+              list="known-opponents"
+            />
+            <datalist id="known-opponents">
+              {knownOpponents.map(o => <option key={o} value={o} />)}
+            </datalist>
+            <button className="result-btn win" onClick={() => addMatch('W')}>
+              WIN
+            </button>
+            <button className="result-btn loss" onClick={() => addMatch('L')}>
+              LOSS
+            </button>
+          </div>
+          <div className="keyboard-hint">
+            type opponent name, then click W/L or hit <kbd>enter</kbd> for win, <kbd>shift+enter</kbd> for loss
+          </div>
+          {knownOpponents.length > 0 && (
+            <div className="quick-chips">
+              {knownOpponents.slice(0, 6).map(o => (
+                <button key={o} className="chip" onClick={() => {
+                  setOpponent(o)
+                  inputRef.current?.focus()
+                }}>
+                  {o}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* STATS CARDS */}
+        {stats.total > 0 && (
+          <div className="stats-grid">
+            <div className="stat-card">
+              <div className="stat-label">win rate</div>
+              <div className="stat-value accent">{stats.winRate.toFixed(1)}%</div>
+              <div className="stat-meta">across {stats.total} games</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">wins</div>
+              <div className="stat-value win">{stats.wins}</div>
+              <div className="stat-meta">total</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">losses</div>
+              <div className="stat-value loss">{stats.losses}</div>
+              <div className="stat-meta">total</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">current streak</div>
+              <div className={`stat-value ${stats.streakType === 'W' ? 'win' : 'loss'}`}>
+                {stats.streak}{stats.streakType}
+              </div>
+              <div className="stat-meta">{stats.streakType === 'W' ? 'on a roll' : 'shake it off'}</div>
+            </div>
+          </div>
+        )}
+
+        {/* OPPONENT BREAKDOWN */}
+        {stats.opponents.length > 0 && (
+          <div className="section">
+            <div className="section-header">
+              <h2 className="section-title">matchup breakdown</h2>
+              <div className="opp-controls">
+                <input
+                  className="filter-input"
+                  placeholder="filter pokemon..."
+                  value={filterText}
+                  onChange={(e) => setFilterText(e.target.value)}
+                />
+                <select
+                  className="sort-select"
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value)}
+                >
+                  <option value="played">sort: played</option>
+                  <option value="winrate">sort: win %</option>
+                  <option value="wins">sort: wins</option>
+                  <option value="losses">sort: losses</option>
+                  <option value="name">sort: name</option>
+                </select>
+              </div>
+            </div>
+            <table className="opp-table">
+              <thead>
+                <tr>
+                  <th>opponent</th>
+                  <th className="num">played</th>
+                  <th className="num">w</th>
+                  <th className="num">l</th>
+                  <th className="num">win rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedOpponents.map(o => {
+                  const wrClass = o.winRate >= 60 ? 'wr-good' : o.winRate < 40 ? 'wr-bad' : 'wr-mid'
+                  return (
+                    <tr key={o.name}>
+                      <td className="opp-name">{o.name}</td>
+                      <td className="num">{o.played}</td>
+                      <td className="num" style={{color: 'var(--win)'}}>{o.wins}</td>
+                      <td className="num" style={{color: 'var(--loss)'}}>{o.losses}</td>
+                      <td className="num">
+                        <div className="winrate-cell">
+                          <div className="winrate-bar">
+                            <div
+                              className="winrate-fill"
+                              style={{
+                                width: `${o.winRate}%`,
+                                background: o.winRate >= 50 ? 'var(--win)' : 'var(--loss)'
+                              }}
+                            />
+                          </div>
+                          <span className={`winrate-text ${wrClass}`}>
+                            {o.winRate.toFixed(0)}%
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* RECENT MATCHES */}
+        {recentMatches.length > 0 && (
+          <div className="section">
+            <div className="section-header">
+              <h2 className="section-title">recent matches</h2>
+              <span style={{color: 'var(--text-dim)', fontFamily: 'JetBrains Mono, monospace', fontSize: '0.75rem'}}>
+                showing {recentMatches.length} of {matches.length}
+              </span>
+            </div>
+            <div className="recent-list">
+              {recentMatches.map(m => {
+                const d = new Date(m.date)
+                const dateStr = d.toLocaleDateString(undefined, {
+                  month: 'short', day: 'numeric'
+                }) + ' · ' + d.toLocaleTimeString(undefined, {
+                  hour: '2-digit', minute: '2-digit'
+                })
+                return (
+                  <div
+                    key={m.id}
+                    className={`recent-item ${flashId === m.id ? 'flash' : ''} ${m.result === 'L' ? 'l' : ''}`}
+                  >
+                    <div className={`result-tag ${m.result}`}>{m.result}</div>
+                    <div className="recent-name">{m.opponent}</div>
+                    <div className="recent-date">{dateStr}</div>
+                    <button
+                      className="delete-btn"
+                      onClick={() => deleteMatch(m.id)}
+                      title="delete this match"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* EMPTY STATE */}
+        {stats.total === 0 && (
+          <div className="empty-state">
+            no matches logged yet. add one above or import your existing data ↓
+          </div>
+        )}
+
+        {/* TOOLS */}
+        <div className="tools-bar">
+          <button className="tool-btn" onClick={() => setShowImport(!showImport)}>
+            {showImport ? '× cancel import' : '+ import data'}
+          </button>
+          {matches.length > 0 && (
+            <>
+              <button className="tool-btn" onClick={downloadCsv}>
+                ↓ export csv
+              </button>
+              {!confirmClear ? (
+                <button className="tool-btn danger" onClick={() => setConfirmClear(true)}>
+                  clear all data
+                </button>
+              ) : (
+                <>
+                  <span style={{
+                    color: 'var(--loss)',
+                    fontFamily: 'JetBrains Mono, monospace',
+                    fontSize: '0.8rem',
+                    alignSelf: 'center'
+                  }}>
+                    delete all {matches.length} matches?
+                  </span>
+                  <button className="tool-btn danger" onClick={clearAll}>
+                    yes, delete
+                  </button>
+                  <button className="tool-btn" onClick={() => setConfirmClear(false)}>
+                    cancel
+                  </button>
+                </>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* IMPORT PANEL */}
+        {showImport && (
+          <div className="import-panel">
+            <h3>import from your sheet</h3>
+            <p>
+              paste rows from your google sheet below. supported formats (one per line):
+              <br />
+              <code>Pikachu, W</code> &nbsp; one match per row
+              <br />
+              <code>Pikachu, WLLWW</code> &nbsp; multiple matches in one row (W/L sequence)
+              <br />
+              <code>Pikachu, 5, 2</code> &nbsp; aggregate (name, wins, losses)
+              <br />
+              you can use commas <em>or</em> tabs as separators (tabs = direct paste from sheets).
+            </p>
+            <textarea
+              className="import-textarea"
+              placeholder={`Pikachu\tW\nCharizard\tL\nGarchomp\t3\t1`}
+              value={importText}
+              onChange={(e) => {
+                setImportText(e.target.value)
+                setImportPreview(null)
+              }}
+            />
+            <div className="import-actions">
+              <button className="tool-btn" onClick={previewImport} disabled={!importText.trim()}>
+                preview
+              </button>
+              {importPreview && (
+                <>
+                  <span className="import-preview-info">
+                    found {importPreview.length} matches
+                  </span>
+                  <button className="tool-btn" onClick={commitImport}>
+                    ✓ add to tracker
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  )
+}
